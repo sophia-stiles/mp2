@@ -1,5 +1,5 @@
 model:
-  _target_: code.model.gemma3.Gemma3AlignmentModel
+  _target_: model.gemma3.Gemma3AlignmentModel
 
   # VideoPrism branch
   model_name: "videoprism_lvt_public_v1_base"
