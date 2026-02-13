@@ -74,7 +74,6 @@ class HTMLVideoAnnotationVisualizer:
         ann_dir: str,
         output_dir: str | None,
         durations: str | None,
-        annotation_file: str,
         mapping_file: str | None = None,
         auto_mapping: bool = False,
         recursive: bool = False,
@@ -87,7 +86,6 @@ class HTMLVideoAnnotationVisualizer:
         self.output_dir = os.path.abspath(output_dir) if output_dir else self.ann_dir
         self.durations_file = durations
         self.durations_data: dict[str, Any] = {}
-        self.annotation_file = annotation_file
         self.mapping_file = mapping_file
         self.auto_mapping = auto_mapping
         self.recursive = recursive
@@ -153,7 +151,9 @@ class HTMLVideoAnnotationVisualizer:
         for video_key in self.videos:
             candidates = self._candidate_output_ids(video_key)
 
-            matched = next((candidate for candidate in candidates if (ann_root / candidate).exists()), None)
+            matched = next(
+                (candidate for candidate in candidates if (ann_root / f"{candidate}.json").exists()), None
+            )
             if matched:
                 mapping[video_key] = matched
                 matched_count += 1
@@ -240,7 +240,7 @@ class HTMLVideoAnnotationVisualizer:
             or self.video_mapping.get(Path(video_file).name)
             or self.video_output_ids.get(video_file, os.path.splitext(Path(video_file).name)[0])
         )
-        ann_path = os.path.join(self.ann_dir, youtube_id, self.annotation_file)
+        ann_path = os.path.join(self.ann_dir, f"{youtube_id}.json")
 
         if os.path.exists(ann_path):
             with open(ann_path) as f:
@@ -444,10 +444,8 @@ class HTMLVideoAnnotationVisualizer:
                         new_annotations = payload["annotations"]
                         new_summary = payload.get("summary")
 
-                        output_dir_path = os.path.join(self.server.output_dir, youtube_id)
-                        output_ann_path = os.path.join(output_dir_path, self.server.annotation_file)
-
-                        os.makedirs(output_dir_path, exist_ok=True)
+                        os.makedirs(self.server.output_dir, exist_ok=True)
+                        output_ann_path = os.path.join(self.server.output_dir, f"{youtube_id}.json")
 
                         updated_data = {
                             "summary": new_summary,
@@ -488,7 +486,6 @@ class HTMLVideoAnnotationVisualizer:
                 server.video_dir = self.video_dir
                 server.ann_dir = self.ann_dir
                 server.output_dir = self.output_dir
-                server.annotation_file = self.annotation_file
                 server.video_paths_map = self.video_paths_map
 
                 ip_address = self.get_ip_address()
@@ -529,10 +526,7 @@ def main() -> None:
     """Parse arguments and run the visualizer."""
     parser = argparse.ArgumentParser(description="HTML Video Annotation Visualizer with Video Playback and Editing")
     parser.add_argument("--video_dir", type=str, required=True, help="Directory containing video files")
-    parser.add_argument("--ann_dir", type=str, required=True, help="Directory containing annotation files")
-    parser.add_argument(
-        "--annotation_file", type=str, required=True, help="Name of the annotation file to load and save"
-    )
+    parser.add_argument("--ann_dir", type=str, required=True, help="Directory containing annotation JSON files")
     parser.add_argument("--output_dir", type=str, help="Directory to save modified annotations. Defaults to ann_dir.")
     parser.add_argument(
         "--durations",
@@ -576,7 +570,6 @@ def main() -> None:
         args.ann_dir,
         args.output_dir,
         args.durations,
-        args.annotation_file,
         args.mapping,
         args.auto_mapping,
         args.recursive,

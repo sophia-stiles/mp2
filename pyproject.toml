@@ -20,4 +20,5 @@ dependencies = [
     "tensorflow",
     "keras",
     "absl-py",
+    "av",
 ]
