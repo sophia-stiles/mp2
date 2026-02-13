@@ -171,7 +171,7 @@ def get_video_embeddings(
     num_frames: int = 16,
     resolution: tuple[int, int] = (288, 288),
     seed: int = 42,
-    batch_size: int = 8,
+    batch_size: int = 1,
 ) -> tuple[jax.Array, list[str]]:
     """Compute L2-normalized video embeddings for every ``.mp4`` in a folder.
 
@@ -179,17 +179,22 @@ def get_video_embeddings(
     so that the ordering is consistent with :func:`get_text_embeddings` when
     both folders contain files with the same names.
 
+    Videos are decoded and embedded in small batches (default 1) to keep
+    memory usage low.
+
     Args:
         video_folder: Path to a directory containing ``.mp4`` video files.
         num_frames: Number of frames to sample per video.
         resolution: Spatial resolution ``(H, W)`` for decoded frames.
         seed: Random seed for frame sampling.
-        batch_size: Videos per forward-pass batch.
+        batch_size: Videos per forward-pass batch (default 1 to save RAM).
 
     Returns:
         ``(embeddings, labels)`` where *embeddings* is a JAX array of shape
         ``(N, D)`` and *labels* is a list of filename stems (without extension).
     """
+    import gc
+
     import torch
 
     from data.utils import decode
@@ -206,29 +211,41 @@ def get_video_embeddings(
 
     rng = random.Random(seed)
 
-    # Decode all videos into tensors
-    video_tensors: list[torch.Tensor] = []
-    for vf in video_files:
-        video_tensor, _meta = decode(
-            str(vf),
-            num_frames,
-            resolution,
-            decode_method="decord",
-            resize_method="center_crop_resize",
-            frame_sampling_method="max_stride",
-            output_range="unit",
-            dtype=torch.float32,
-            rng=rng,
-        )
-        video_tensors.append(video_tensor)
-
-    # Forward in batches
+    # Decode and embed in batches to keep memory usage low.
     emb_list: list[jax.Array] = []
-    for i in range(0, len(video_tensors), batch_size):
-        batch = torch.stack(video_tensors[i : i + batch_size], dim=0)
+    for i in range(0, len(video_files), batch_size):
+        batch_files = video_files[i : i + batch_size]
+        print(f"  Processing videos {i + 1}–{i + len(batch_files)} / {len(video_files)} …")
+
+        # Decode only this batch's videos
+        video_tensors = []
+        for vf in batch_files:
+            video_tensor, _meta = decode(
+                str(vf),
+                num_frames,
+                resolution,
+                decode_method="decord",
+                resize_method="center_crop_resize",
+                frame_sampling_method="max_stride",
+                output_range="unit",
+                dtype=torch.float32,
+                rng=rng,
+            )
+            video_tensors.append(video_tensor)
+
+        batch = torch.stack(video_tensors, dim=0)
         video_input = jnp.asarray(batch.numpy())
+
+        # Free torch tensors before the forward pass
+        del video_tensors, batch
+        gc.collect()
+
         v_emb = model.get_adapted_video_embeddings(params, video_input, train=False)
         emb_list.append(l2_normalize(v_emb.astype(jnp.float32)))
+
+        # Free the JAX input array
+        del video_input, v_emb
+        gc.collect()
 
     return jnp.concatenate(emb_list, axis=0), labels
 
@@ -281,12 +298,17 @@ def get_text_embeddings(
 
     print(f"Found {len(texts)} captions in {text_folder}")
 
+    import gc
+
     emb_list: list[jax.Array] = []
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i : i + batch_size]
+        print(f"  Processing texts {i + 1}–{i + len(batch_texts)} / {len(texts)} …")
         tokenized = model.tokenize(batch_texts)
         t_emb = model.get_adapted_text_embeddings(params, tokenized, train=False)
         emb_list.append(l2_normalize(t_emb.astype(jnp.float32)))
+        del tokenized, t_emb
+        gc.collect()
 
     return jnp.concatenate(emb_list, axis=0), labels
 
