@@ -5,6 +5,7 @@ Provides four main functions:
     - get_text_embeddings(text_folder)
     - plot_similarity_matrix(video_embeddings, text_embeddings)
     - plot_tsne(video_embeddings, text_embeddings)
+    - build_tsne_baseline(...) / overlay_tsne_points(...)
 
 Quick start::
 
@@ -31,7 +32,11 @@ Quick start::
 from __future__ import annotations
 
 import json
+import colorsys
+import hashlib
+import pickle
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -808,6 +813,8 @@ def plot_tsne(
     labels: list[str] | None = None,
     seed: int = 42,
     perplexity: float | None = None,
+    axis_padding: float = 0.10,
+    figsize: tuple[float, float] = (10, 8),
     show: bool = True,
 ):
     """Plot a joint t-SNE of video and text embeddings.
@@ -821,6 +828,9 @@ def plot_tsne(
         labels: Optional label per sample (length ``N``).
         seed: Random seed for t-SNE.
         perplexity: t-SNE perplexity; auto-chosen if *None*.
+        axis_padding: Extra margin added around t-SNE points as a fraction of
+            x/y data range (e.g., 0.10 adds 10% padding on each side).
+        figsize: Figure size passed to ``plt.subplots``.
 
     Returns:
         The matplotlib ``Figure`` when ``show=False``; otherwise ``None``.
@@ -852,7 +862,7 @@ def plot_tsne(
     )
     coords = tsne.fit_transform(all_emb)
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=figsize)
     unique_labels = sorted(set(labels))
     cmap = plt.cm.get_cmap("tab10", len(unique_labels))
     label_to_color = {lab: cmap(i) for i, lab in enumerate(unique_labels)}
@@ -874,6 +884,16 @@ def plot_tsne(
             color=label_to_color[labels[i]], alpha=0.3, linestyle="--", linewidth=0.8,
         )
 
+    # Expand axis limits so dense clusters and labels are easier to inspect.
+    x_min, x_max = float(np.min(coords[:, 0])), float(np.max(coords[:, 0]))
+    y_min, y_max = float(np.min(coords[:, 1])), float(np.max(coords[:, 1]))
+    x_range = max(x_max - x_min, 1e-8)
+    y_range = max(y_max - y_min, 1e-8)
+    x_pad = x_range * max(axis_padding, 0.0)
+    y_pad = y_range * max(axis_padding, 0.0)
+    ax.set_xlim(x_min - x_pad, x_max + x_pad)
+    ax.set_ylim(y_min - y_pad, y_max + y_pad)
+
     # Legend for labels
     for lab in unique_labels:
         ax.scatter([], [], c=[label_to_color[lab]], marker="s", label=lab)
@@ -890,6 +910,335 @@ def plot_tsne(
         plt.show()
 
     return None if show else fig
+
+
+def _to_numpy_2d(x: jax.Array | np.ndarray, *, name: str) -> np.ndarray:
+    """Convert input to a 2D numpy array."""
+    arr = np.asarray(x)
+    if arr.ndim != 2:
+        raise ValueError(f"{name} must be 2D with shape (N, D); got shape {arr.shape}")
+    return arr
+
+
+def _strip_segment_suffix(label: str) -> str:
+    """Map labels like '<video>#seg003' to '<video>'."""
+    return re.sub(r"#seg\d+$", "", str(label))
+
+
+def _stable_color_for_video_id(video_id: str) -> tuple[float, float, float]:
+    """Generate a deterministic RGB color for a video id."""
+    digest = hashlib.md5(video_id.encode("utf-8")).hexdigest()
+    hue = int(digest[:8], 16) / float(16**8 - 1)
+    # Keep saturation/value fixed for readability and contrast.
+    return colorsys.hsv_to_rgb(hue, 0.65, 0.90)
+
+
+def save_embeddings_npz(
+    output_path: str | Path,
+    video_embeddings: jax.Array | np.ndarray,
+    video_labels: list[str],
+    *,
+    text_embeddings: jax.Array | np.ndarray | None = None,
+    text_labels: list[str] | None = None,
+) -> Path:
+    """Save embeddings + labels into a compressed .npz file.
+
+    Saved keys:
+      - video_embeddings (N_video, D)
+      - video_labels (N_video,)
+      - text_embeddings (N_text, D), optional
+      - text_labels (N_text,), optional
+    """
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    video_np = _to_numpy_2d(video_embeddings, name="video_embeddings")
+    if len(video_labels) != video_np.shape[0]:
+        raise ValueError("len(video_labels) must match video_embeddings rows")
+
+    payload: dict[str, np.ndarray] = {
+        "video_embeddings": video_np.astype(np.float32, copy=False),
+        "video_labels": np.asarray(video_labels, dtype=str),
+    }
+
+    if text_embeddings is not None:
+        text_np = _to_numpy_2d(text_embeddings, name="text_embeddings")
+        payload["text_embeddings"] = text_np.astype(np.float32, copy=False)
+        if text_labels is None:
+            text_labels = [f"text_{i}" for i in range(text_np.shape[0])]
+        if len(text_labels) != text_np.shape[0]:
+            raise ValueError("len(text_labels) must match text_embeddings rows")
+        payload["text_labels"] = np.asarray(text_labels, dtype=str)
+    elif text_labels is not None:
+        raise ValueError("text_labels was provided but text_embeddings is None")
+
+    np.savez_compressed(output, **payload)
+    return output
+
+
+def load_embeddings_npz(npz_path: str | Path) -> dict[str, np.ndarray | list[str] | None]:
+    """Load embedding arrays from .npz with tolerant key aliases."""
+    path = Path(npz_path).expanduser().resolve()
+    with np.load(path, allow_pickle=True) as data:
+        keys = set(data.files)
+
+        def _pick(candidates: list[str], required: bool) -> np.ndarray | None:
+            for key in candidates:
+                if key in keys:
+                    return np.asarray(data[key])
+            if required:
+                raise KeyError(f"Missing required key. Tried {candidates}, found {sorted(keys)}")
+            return None
+
+        video_embeddings = _pick(["video_embeddings", "video_embeds", "video_emb"], required=True)
+        video_labels = _pick(["video_labels", "labels", "video_ids"], required=True)
+        text_embeddings = _pick(["text_embeddings", "text_embeds", "text_emb"], required=False)
+        text_labels = _pick(["text_labels", "caption_labels"], required=False)
+
+    video_np = _to_numpy_2d(video_embeddings, name="video_embeddings")
+    video_labels_list = [str(x) for x in np.asarray(video_labels).tolist()]
+    if len(video_labels_list) != video_np.shape[0]:
+        raise ValueError("video_labels length does not match video_embeddings rows")
+
+    text_np: np.ndarray | None = None
+    text_labels_list: list[str] | None = None
+    if text_embeddings is not None:
+        text_np = _to_numpy_2d(text_embeddings, name="text_embeddings")
+        if text_labels is None:
+            text_labels_list = [f"text_{i}" for i in range(text_np.shape[0])]
+        else:
+            text_labels_list = [str(x) for x in np.asarray(text_labels).tolist()]
+            if len(text_labels_list) != text_np.shape[0]:
+                raise ValueError("text_labels length does not match text_embeddings rows")
+
+    return {
+        "video_embeddings": video_np.astype(np.float32, copy=False),
+        "video_labels": video_labels_list,
+        "text_embeddings": None if text_np is None else text_np.astype(np.float32, copy=False),
+        "text_labels": text_labels_list,
+    }
+
+
+def build_tsne_baseline(
+    video_embeddings: jax.Array | np.ndarray,
+    video_labels: list[str],
+    *,
+    text_embeddings: jax.Array | np.ndarray | None = None,
+    text_labels: list[str] | None = None,
+    perplexity: float = 30.0,
+    metric: str = "cosine",
+    random_state: int = 42,
+    standardize: bool = True,
+) -> dict:
+    """Fit an openTSNE baseline that can later transform new points.
+
+    Returns a pickle-serializable session dict containing:
+      - baseline_coords: (N, 2) baseline t-SNE coordinates
+      - labels/modality/video_ids for baseline points
+      - tsne_model: fitted openTSNE embedding object (supports transform)
+      - scaler: fitted StandardScaler or None
+    """
+    try:
+        from openTSNE import TSNE
+    except ImportError as exc:
+        raise ImportError(
+            "openTSNE is required for incremental t-SNE transforms. "
+            "Install with: pip install openTSNE"
+        ) from exc
+
+    video_np = _to_numpy_2d(video_embeddings, name="video_embeddings")
+    if len(video_labels) != video_np.shape[0]:
+        raise ValueError("len(video_labels) must match video_embeddings rows")
+
+    labels: list[str] = [str(x) for x in video_labels]
+    modalities: list[str] = ["video"] * len(labels)
+    all_parts: list[np.ndarray] = [video_np]
+
+    if text_embeddings is not None:
+        text_np = _to_numpy_2d(text_embeddings, name="text_embeddings")
+        if text_labels is None:
+            text_labels = [f"text_{i}" for i in range(text_np.shape[0])]
+        if len(text_labels) != text_np.shape[0]:
+            raise ValueError("len(text_labels) must match text_embeddings rows")
+        all_parts.append(text_np)
+        labels.extend([str(x) for x in text_labels])
+        modalities.extend(["text"] * text_np.shape[0])
+
+    all_emb = np.concatenate(all_parts, axis=0).astype(np.float32, copy=False)
+
+    scaler = None
+    all_emb_proc = all_emb
+    if standardize:
+        from sklearn.preprocessing import StandardScaler
+
+        scaler = StandardScaler()
+        all_emb_proc = scaler.fit_transform(all_emb).astype(np.float32, copy=False)
+
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        metric=metric,
+        random_state=random_state,
+        initialization="pca",
+    )
+    embedding = tsne.fit(all_emb_proc)
+    coords = np.asarray(embedding, dtype=np.float32)
+    video_ids = [_strip_segment_suffix(lab) for lab in labels]
+
+    return {
+        "baseline_coords": coords,
+        "labels": labels,
+        "modalities": modalities,
+        "video_ids": video_ids,
+        "tsne_model": embedding,
+        "scaler": scaler,
+        "config": {
+            "perplexity": perplexity,
+            "metric": metric,
+            "random_state": random_state,
+            "standardize": standardize,
+        },
+    }
+
+
+def build_tsne_baseline_from_npz(
+    npz_path: str | Path,
+    *,
+    perplexity: float = 30.0,
+    metric: str = "cosine",
+    random_state: int = 42,
+    standardize: bool = True,
+) -> dict:
+    """Load embeddings from .npz and fit an incremental t-SNE baseline."""
+    loaded = load_embeddings_npz(npz_path)
+    return build_tsne_baseline(
+        loaded["video_embeddings"],
+        loaded["video_labels"],
+        text_embeddings=loaded["text_embeddings"],
+        text_labels=loaded["text_labels"],
+        perplexity=perplexity,
+        metric=metric,
+        random_state=random_state,
+        standardize=standardize,
+    )
+
+
+def save_tsne_session(session: dict, output_path: str | Path) -> Path:
+    """Persist a t-SNE baseline session to disk with pickle."""
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with open(output, "wb") as f:
+        pickle.dump(session, f)
+    return output
+
+
+def load_tsne_session(session_path: str | Path) -> dict:
+    """Load a previously saved t-SNE baseline session."""
+    path = Path(session_path).expanduser().resolve()
+    with open(path, "rb") as f:
+        session = pickle.load(f)
+    return session
+
+
+def plot_tsne_session(
+    session: dict,
+    *,
+    figsize: tuple[float, float] = (11, 8),
+    title: str = "Baseline t-SNE: Video/Text Embeddings",
+    alpha: float = 0.85,
+    s: float = 35,
+    show: bool = True,
+):
+    """Plot baseline points from a fitted t-SNE session."""
+    import matplotlib.pyplot as plt
+
+    coords = np.asarray(session["baseline_coords"])
+    labels = list(session["labels"])
+    modalities = list(session["modalities"])
+    video_ids = list(session["video_ids"])
+
+    fig, ax = plt.subplots(figsize=figsize)
+    unique_video_ids = sorted(set(video_ids))
+    for vid in unique_video_ids:
+        idx = [i for i, x in enumerate(video_ids) if x == vid]
+        if not idx:
+            continue
+        color = _stable_color_for_video_id(vid)
+        idx_video = [i for i in idx if modalities[i] == "video"]
+        idx_text = [i for i in idx if modalities[i] == "text"]
+        if idx_video:
+            xy = coords[np.asarray(idx_video)]
+            ax.scatter(xy[:, 0], xy[:, 1], c=[color], s=s, alpha=alpha, marker="o", label=vid)
+        if idx_text:
+            xy = coords[np.asarray(idx_text)]
+            ax.scatter(xy[:, 0], xy[:, 1], c=[color], s=s + 5, alpha=alpha, marker="x")
+
+    ax.set_title(title)
+    ax.set_xlabel("t-SNE 1")
+    ax.set_ylabel("t-SNE 2")
+
+    # Keep legend compact for many videos.
+    if len(unique_video_ids) <= 25:
+        ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
+    plt.tight_layout()
+    if show:
+        plt.show()
+    return None if show else (fig, ax)
+
+
+def overlay_tsne_points(
+    session: dict,
+    new_embeddings: jax.Array | np.ndarray,
+    new_labels: list[str],
+    *,
+    modality: str = "video",
+    ax=None,
+    marker: str | None = None,
+    s: float = 70,
+    alpha: float = 0.95,
+) -> np.ndarray:
+    """Transform and overlay new points onto an existing baseline t-SNE axes.
+
+    Notes:
+      - Requires a baseline session fitted by build_tsne_baseline.
+      - `new_labels` can be segment labels (e.g. '<video>#seg004'); points from
+        the same base video id share a deterministic color.
+    """
+    import matplotlib.pyplot as plt
+
+    new_np = _to_numpy_2d(new_embeddings, name="new_embeddings").astype(np.float32, copy=False)
+    if len(new_labels) != new_np.shape[0]:
+        raise ValueError("len(new_labels) must match new_embeddings rows")
+
+    scaler = session.get("scaler")
+    tsne_model = session.get("tsne_model")
+    if tsne_model is None:
+        raise ValueError("Session is missing `tsne_model`; cannot transform new points.")
+
+    new_proc = scaler.transform(new_np) if scaler is not None else new_np
+    new_xy = np.asarray(tsne_model.transform(new_proc), dtype=np.float32)
+    new_video_ids = [_strip_segment_suffix(lab) for lab in new_labels]
+
+    if ax is None:
+        _fig, ax = plt.subplots(figsize=(8, 6))
+
+    point_marker = marker if marker is not None else ("^" if modality == "video" else "P")
+    for vid in sorted(set(new_video_ids)):
+        idx = [i for i, x in enumerate(new_video_ids) if x == vid]
+        xy = new_xy[np.asarray(idx)]
+        color = _stable_color_for_video_id(vid)
+        ax.scatter(
+            xy[:, 0],
+            xy[:, 1],
+            c=[color],
+            s=s,
+            alpha=alpha,
+            marker=point_marker,
+            edgecolors="k",
+            linewidths=0.7,
+        )
+
+    return new_xy
 
 
 # ---------------------------------------------------------------------------
