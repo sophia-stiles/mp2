@@ -37,6 +37,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+from jax.dlpack import from_dlpack
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -161,6 +162,20 @@ def _get_model_and_params():
 # Core helpers
 # ---------------------------------------------------------------------------
 
+def to_bfloat16(x):
+    """Convert a JAX array or pytree of arrays to bfloat16.
+
+    Only floating-point leaves are cast; integer and other dtypes are left
+    unchanged.  Works on single arrays, nested dicts/lists (pytrees), or any
+    structure ``jax.tree_util`` can traverse.
+    """
+    def _cast(leaf):
+        if hasattr(leaf, "dtype") and jnp.issubdtype(leaf.dtype, jnp.floating):
+            return leaf.astype(jnp.bfloat16)
+        return leaf
+    return jax.tree_util.tree_map(_cast, x)
+
+
 def l2_normalize(x: jax.Array, eps: float = 1e-8) -> jax.Array:
     """L2-normalize along the last axis."""
     return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + eps)
@@ -219,6 +234,10 @@ def get_video_embeddings(
 
     rng = random.Random(seed)
 
+    @jax.jit
+    def _jit_video_forward(params, video_input):
+        return model.get_adapted_video_embeddings(params, video_input, train=False)
+
     emb_list: list[jax.Array] = []
     labels: list[str] = []
     for i in range(0, len(video_files), batch_size):
@@ -237,7 +256,7 @@ def get_video_embeddings(
                     resize_method="center_crop_resize",
                     frame_sampling_method="max_stride",
                     output_range="unit",
-                    dtype=torch.float32,
+                    dtype=torch.bfloat16,
                     rng=rng,
                 )
                 if video_tensor.shape[0] == 0:
@@ -252,13 +271,12 @@ def get_video_embeddings(
         if not video_tensors:
             continue
 
-        batch = torch.stack(video_tensors, dim=0)
-        video_input = jnp.asarray(batch.numpy())
+        video_input = jnp.stack([from_dlpack(t) for t in video_tensors], axis=0)
 
-        del video_tensors, batch
+        del video_tensors
         gc.collect()
 
-        v_emb = model.get_adapted_video_embeddings(params, video_input, train=False)
+        v_emb = _jit_video_forward(to_bfloat16(params), video_input)
         emb_list.append(l2_normalize(v_emb.astype(jnp.float32)))
         labels.extend(batch_labels)
 
@@ -385,7 +403,8 @@ def get_text_embeddings(
         batch_texts = texts[i : i + batch_size]
         print(f"  Processing texts {i + 1}–{i + len(batch_texts)} / {len(texts)} …")
         tokenized = model.tokenize(batch_texts)
-        t_emb = model.get_adapted_text_embeddings(params, tokenized, train=False)
+        tokenized = to_bfloat16(tokenized)
+        t_emb = model.get_adapted_text_embeddings(to_bfloat16(params), tokenized, train=False)
         emb_list.append(l2_normalize(t_emb.astype(jnp.float32)))
         del tokenized, t_emb
         gc.collect()
