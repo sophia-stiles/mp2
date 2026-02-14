@@ -194,6 +194,70 @@ def l2_normalize(x: jax.Array, eps: float = 1e-8) -> jax.Array:
     return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + eps)
 
 
+def _parse_timecode_to_seconds(value: str | float | int) -> float | None:
+    """Parse a timestamp into seconds.
+
+    Supports:
+      - ``HH:MM:SS(.mmm)``, e.g. ``0:05:46.400``
+      - ``MM:SS(.mmm)``
+      - numeric values already in seconds
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+
+    # Fast path: already numeric text in seconds.
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    parts = text.split(":")
+    try:
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+            return hours * 3600.0 + minutes * 60.0 + seconds
+        if len(parts) == 2:
+            minutes = int(parts[0])
+            seconds = float(parts[1])
+            return minutes * 60.0 + seconds
+    except ValueError:
+        return None
+    return None
+
+
+def _extract_annotation_intervals(
+    data: dict,
+    segment_key: str = "video_descriptions",
+) -> list[tuple[float, float]]:
+    """Extract sorted ``(start_s, end_s)`` intervals from annotation JSON."""
+    raw_segments = data.get(segment_key)
+    if not isinstance(raw_segments, list):
+        return []
+
+    intervals: list[tuple[float, float]] = []
+    for seg in raw_segments:
+        if not isinstance(seg, dict):
+            continue
+        start_s = _parse_timecode_to_seconds(seg.get("t0"))
+        end_s = _parse_timecode_to_seconds(seg.get("t1"))
+        if start_s is None or end_s is None:
+            continue
+        if end_s <= start_s:
+            continue
+        intervals.append((float(start_s), float(end_s)))
+
+    intervals.sort(key=lambda x: (x[0], x[1]))
+    return intervals
+
+
 # ---------------------------------------------------------------------------
 # Embedding functions
 # ---------------------------------------------------------------------------
@@ -201,6 +265,9 @@ def l2_normalize(x: jax.Array, eps: float = 1e-8) -> jax.Array:
 def get_video_embeddings(
     video_folder: str | Path,
     *,
+    annotation_folder: str | Path | None = None,
+    segment_key: str = "video_descriptions",
+    min_interval_segments: int = 2,
     model=None,
     params=None,
     num_frames: int = 16,
@@ -214,11 +281,22 @@ def get_video_embeddings(
     so that the ordering is consistent with :func:`get_text_embeddings` when
     both folders contain files with the same names.
 
-    Videos that fail to decode (corrupt files, unsupported codecs, or videos
-    with fewer frames than ``num_frames``) are skipped with a warning.
+    If a matching annotation file ``<stem>.json`` exists, the function extracts
+    time segments from ``segment_key`` and decodes interval clips by calling
+    :func:`data.utils.decode` with ``frame_sampling_method="interval"``.
+    Overlapping segments are supported and processed independently.
+
+    If no annotation exists, segment extraction fails, or the number of valid
+    segments is below ``min_interval_segments``, the function falls back to
+    full-video decoding (single embedding for that video).
 
     Args:
         video_folder: Path to a directory containing ``.mp4`` video files.
+        annotation_folder: Directory with ``.json`` annotations. If *None*,
+            defaults to ``video_folder``.
+        segment_key: JSON key that contains a list of segments with ``t0``/``t1``.
+        min_interval_segments: Minimum number of valid intervals required to use
+            interval decoding; otherwise full-video fallback is used.
         model: Pre-loaded model object.  If *None*, uses the global singleton.
         params: Pre-loaded model params.  Must be provided together with *model*.
         num_frames: Number of frames to sample per video.
@@ -239,11 +317,13 @@ def get_video_embeddings(
         model, params = _get_model_and_params()
 
     video_folder = Path(video_folder)
+    annotation_folder = Path(annotation_folder) if annotation_folder is not None else video_folder
     video_files = sorted(video_folder.glob("*.mp4"), key=lambda p: p.stem)
     if not video_files:
         raise FileNotFoundError(f"No .mp4 files found in {video_folder}")
 
     print(f"Found {len(video_files)} videos in {video_folder}")
+    print(f"Using annotations from: {annotation_folder}")
 
     rng = random.Random(seed)
 
@@ -251,15 +331,87 @@ def get_video_embeddings(
     def _jit_video_forward(params, video_input):
         return model.get_adapted_video_embeddings(params, video_input, train=False)
 
+    def _flush_batch(
+        pending_tensors: list[torch.Tensor],
+        pending_labels: list[str],
+        emb_list: list[jax.Array],
+        labels: list[str],
+    ) -> None:
+        """Run one forward pass on pending tensors and append outputs."""
+        if not pending_tensors:
+            return
+        jax_frames = [from_dlpack(t.contiguous()) for t in pending_tensors]
+        del pending_tensors[:]
+        gc.collect()
+
+        video_input = jnp.stack(jax_frames, axis=0)
+        del jax_frames
+        gc.collect()
+
+        v_emb = _jit_video_forward(params, video_input)
+        emb_list.append(np.asarray(l2_normalize(v_emb.astype(jnp.float32))))
+        labels.extend(pending_labels)
+        del pending_labels[:]
+
+        del video_input, v_emb
+        gc.collect()
+
     emb_list: list[jax.Array] = []
     labels: list[str] = []
-    for i in range(0, len(video_files), batch_size):
-        batch_files = video_files[i : i + batch_size]
-        print(f"  Processing videos {i + 1}–{i + len(batch_files)} / {len(video_files)} …")
+    pending_tensors: list[torch.Tensor] = []
+    pending_labels: list[str] = []
 
-        video_tensors = []
-        batch_labels = []
-        for vf in batch_files:
+    for idx, vf in enumerate(video_files, start=1):
+        print(f"  Processing video {idx} / {len(video_files)}: {vf.name} …")
+        ann_path = annotation_folder / f"{vf.stem}.json"
+        intervals: list[tuple[float, float]] = []
+        if ann_path.exists():
+            try:
+                with open(ann_path) as f:
+                    ann_data = json.load(f)
+                intervals = _extract_annotation_intervals(ann_data, segment_key=segment_key)
+            except Exception as exc:
+                print(f"    WARNING: failed to parse {ann_path.name}: {exc} — full-video fallback")
+        else:
+            print(f"    NOTE: no annotation for {vf.name} at {ann_path.name} — full-video fallback")
+
+        use_intervals = len(intervals) >= min_interval_segments
+        if use_intervals:
+            print(f"    Using {len(intervals)} interval segments from '{segment_key}'")
+            for seg_idx, (start_s, end_s) in enumerate(intervals):
+                try:
+                    video_tensor, _meta = decode(
+                        str(vf),
+                        num_frames,
+                        resolution,
+                        decode_method="pyav",
+                        resize_method="center_crop_resize",
+                        frame_sampling_method="interval",
+                        output_range="unit",
+                        dtype=torch.bfloat16,
+                        rng=rng,
+                        interval=(start_s, end_s),
+                    )
+                    if video_tensor.shape[0] == 0:
+                        print(
+                            f"    WARNING: {vf.name} segment {seg_idx} [{start_s:.3f}, {end_s:.3f}] "
+                            "decoded to 0 frames — skipping"
+                        )
+                        continue
+                    pending_tensors.append(video_tensor)
+                    pending_labels.append(f"{vf.stem}#seg{seg_idx:03d}")
+                except Exception as exc:
+                    print(f"    WARNING: failed interval decode for {vf.name} seg {seg_idx}: {exc} — skipping")
+                    continue
+
+                if len(pending_tensors) >= batch_size:
+                    _flush_batch(pending_tensors, pending_labels, emb_list, labels)
+        else:
+            if ann_path.exists():
+                print(
+                    f"    NOTE: only {len(intervals)} valid segments (< {min_interval_segments}); "
+                    "using full-video fallback"
+                )
             try:
                 video_tensor, _meta = decode(
                     str(vf),
@@ -275,35 +427,16 @@ def get_video_embeddings(
                 if video_tensor.shape[0] == 0:
                     print(f"    WARNING: {vf.name} decoded to 0 frames — skipping")
                     continue
-                video_tensors.append(video_tensor)
-                batch_labels.append(vf.stem)
+                pending_tensors.append(video_tensor)
+                pending_labels.append(vf.stem)
             except Exception as exc:
                 print(f"    WARNING: failed to decode {vf.name}: {exc} — skipping")
                 continue
 
-        if not video_tensors:
-            continue
+            if len(pending_tensors) >= batch_size:
+                _flush_batch(pending_tensors, pending_labels, emb_list, labels)
 
-        # Convert each PyTorch tensor to JAX one-at-a-time so the
-        # PyTorch copy can be freed immediately, avoiding holding two
-        # full copies (PyTorch + JAX) of the batch in RAM at once.
-        jax_frames = []
-        for t in video_tensors:
-            jax_frames.append(from_dlpack(t.contiguous()))
-        del video_tensors
-        gc.collect()
-
-        video_input = jnp.stack(jax_frames, axis=0)
-        del jax_frames
-        gc.collect()
-
-        v_emb = _jit_video_forward(params, video_input)
-        # Move to numpy immediately so the JAX device buffer is freed.
-        emb_list.append(np.asarray(l2_normalize(v_emb.astype(jnp.float32))))
-        labels.extend(batch_labels)
-
-        del video_input, v_emb
-        gc.collect()
+    _flush_batch(pending_tensors, pending_labels, emb_list, labels)
 
     if not emb_list:
         raise RuntimeError(

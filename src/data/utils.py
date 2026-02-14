@@ -525,7 +525,7 @@ def decode(
     output_range: OutputRange = "unit",
     dtype: str | torch.dtype = torch.float32,
     rng: random.Random | None = None,
-    interval: Sequence[float] | None = None,
+    interval: Sequence[float] | None = None, # set this in seconds
 ) -> tuple[jt.Real[torch.Tensor, "t h w c"], dict[str, Any]]:
     """Decode a video, optionally within a temporal interval.
 
