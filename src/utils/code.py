@@ -32,6 +32,7 @@ Quick start::
 from __future__ import annotations
 
 import json
+from typing import Any
 import colorsys
 import hashlib
 import pickle
@@ -1196,13 +1197,14 @@ def overlay_tsne_points(
     marker: str | None = None,
     s: float = 70,
     alpha: float = 0.95,
+    color: Any | None = None,
 ) -> np.ndarray:
     """Transform and overlay new points onto an existing baseline t-SNE axes.
 
     Notes:
       - Requires a baseline session fitted by build_tsne_baseline.
       - `new_labels` can be segment labels (e.g. '<video>#seg004'); points from
-        the same base video id share a deterministic color.
+        the same base video id share a deterministic color (unless overridden).
     """
     import matplotlib.pyplot as plt
 
@@ -1226,11 +1228,12 @@ def overlay_tsne_points(
     for vid in sorted(set(new_video_ids)):
         idx = [i for i, x in enumerate(new_video_ids) if x == vid]
         xy = new_xy[np.asarray(idx)]
-        color = _stable_color_for_video_id(vid)
+        # Use provided color if available, otherwise stable video color
+        plot_color = color if color is not None else _stable_color_for_video_id(vid)
         ax.scatter(
             xy[:, 0],
             xy[:, 1],
-            c=[color],
+            c=[plot_color],
             s=s,
             alpha=alpha,
             marker=point_marker,
