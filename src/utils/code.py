@@ -1,10 +1,10 @@
 """Importable utilities for video-text embedding inference.
 
-Provides four main functions:
-    - get_video_embeddings(video_folder)
-    - get_text_embeddings(text_folder)
-    - plot_similarity_matrix(video_embeddings, text_embeddings)
-    - plot_tsne(video_embeddings, text_embeddings)
+Provides main functions:
+    - get_video_embeddings(video_folder, annotation_folder, npz_filepath)
+    - get_text_embeddings(annotation_folder, npz_filepath)
+    - plot_similarity_matrix(video_data, text_data)
+    - plot_tsne(video_data, text_data, bg_npz_vid_filepath, bg_npz_text_filepath)
     - build_tsne_baseline(...) / overlay_tsne_points(...)
 
 Quick start::
@@ -20,13 +20,15 @@ Quick start::
     # 1. Load model (with optional fine-tuned checkpoint)
     load_model(checkpoint_path="params.msgpack")
 
-    # 2. Compute embeddings — point at your folders
-    video_emb, labels = get_video_embeddings("path/to/videos/")
-    text_emb,  _      = get_text_embeddings("path/to/captions/")
+    # 2. Compute embeddings — returns (embeddings, labels) tuples
+    vid_data = get_video_embeddings("videos/", "annotations/", "vid.npz")
+    txt_data = get_text_embeddings("annotations/", "txt.npz")
 
-    # 3. Visualize
-    plot_similarity_matrix(video_emb, text_emb, labels=labels)
-    plot_tsne(video_emb, text_emb, labels=labels)
+    # 3. Visualize — accepts the tuples directly
+    plot_similarity_matrix(vid_data, txt_data)
+    plot_tsne(vid_data, txt_data)
+    plot_tsne(vid_data, txt_data, bg_npz_vid_filepath="bg_vid.npz",
+              bg_npz_text_filepath="bg_txt.npz")
 """
 
 from __future__ import annotations
@@ -302,8 +304,9 @@ def _extract_annotation_segment_texts(
 
 def get_video_embeddings(
     video_folder: str | Path,
-    *,
     annotation_folder: str | Path | None = None,
+    npz_filepath: str | Path | None = None,
+    *,
     segment_key: str = "video_descriptions",
     min_interval_segments: int = 2,
     segment_progress_every: int = 100,
@@ -532,7 +535,20 @@ def get_video_embeddings(
             f"attempted={global_segment_done}, successful={global_segment_ok}, "
             f"failed={global_segment_done - global_segment_ok}"
         )
-    return jnp.asarray(np.concatenate(emb_list, axis=0)), labels
+
+    embeddings = jnp.asarray(np.concatenate(emb_list, axis=0))
+
+    if npz_filepath is not None:
+        _save_path = Path(npz_filepath).expanduser().resolve()
+        _save_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            _save_path,
+            video_embeddings=np.asarray(embeddings, dtype=np.float32),
+            video_labels=np.asarray(labels, dtype=str),
+        )
+        print(f"  Saved video embeddings ({len(labels)} segments) to {_save_path}")
+
+    return embeddings, labels
 
 
 def _extract_caption(data: dict, caption_key: str) -> str | None:
@@ -583,11 +599,12 @@ def _extract_caption(data: dict, caption_key: str) -> str | None:
 
 def get_text_embeddings(
     text_folder: str | Path,
+    npz_filepath: str | Path | None = None,
     *,
     model=None,
     params=None,
     caption_key: str = "summary",
-    segment_level: bool = False,
+    segment_level: bool = True,
     segment_key: str = "video_descriptions",
     segment_text_key: str = "text",
     min_interval_segments: int = 2,
@@ -688,7 +705,19 @@ def get_text_embeddings(
         del tokenized, t_emb
         gc.collect()
 
-    return jnp.asarray(np.concatenate(emb_list, axis=0)), labels
+    embeddings = jnp.asarray(np.concatenate(emb_list, axis=0))
+
+    if npz_filepath is not None:
+        _save_path = Path(npz_filepath).expanduser().resolve()
+        _save_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            _save_path,
+            text_embeddings=np.asarray(embeddings, dtype=np.float32),
+            text_labels=np.asarray(labels, dtype=str),
+        )
+        print(f"  Saved text embeddings ({len(labels)} segments) to {_save_path}")
+
+    return embeddings, labels
 
 
 # ---------------------------------------------------------------------------
@@ -696,23 +725,38 @@ def get_text_embeddings(
 # ---------------------------------------------------------------------------
 
 def plot_similarity_matrix(
-    video_embeddings: jax.Array | np.ndarray,
-    text_embeddings: jax.Array | np.ndarray,
+    video_embeddings,
+    text_embeddings,
     *,
     labels: list[str] | None = None,
     show: bool = True,
 ):
     """Plot the cosine-similarity matrix between text and video embeddings.
 
+    Accepts either raw arrays of shape ``(N, D)`` **or** the ``(embeddings,
+    labels)`` tuples returned by :func:`get_video_embeddings` /
+    :func:`get_text_embeddings`.
+
     Args:
-        video_embeddings: Array of shape ``(N, D)``.
-        text_embeddings: Array of shape ``(M, D)`` (typically ``M == N``).
-        labels: Optional tick labels for each sample.
+        video_embeddings: Array ``(N, D)`` or ``(array, labels)`` tuple.
+        text_embeddings: Array ``(M, D)`` or ``(array, labels)`` tuple.
+        labels: Optional tick labels.  Auto-detected from tuples if not given.
+        show: If *True* (default), display the plot immediately.
 
     Returns:
         The matplotlib ``Figure`` when ``show=False``; otherwise ``None``.
     """
     import matplotlib.pyplot as plt
+
+    # Unpack (embeddings, labels) tuples from get_video/text_embeddings
+    if isinstance(video_embeddings, (tuple, list)) and len(video_embeddings) == 2:
+        video_embeddings, _vid_labels = video_embeddings
+        if labels is None:
+            labels = _vid_labels
+    if isinstance(text_embeddings, (tuple, list)) and len(text_embeddings) == 2:
+        text_embeddings, _txt_labels = text_embeddings
+        if labels is None:
+            labels = _txt_labels
 
     video_np = np.asarray(video_embeddings)
     text_np = np.asarray(text_embeddings)
@@ -807,53 +851,116 @@ def align_embeddings_by_labels(
     )
 
 
+def _unpack_embedding_data(data):
+    """Accept ``(embeddings, labels)`` tuple or a bare embeddings array.
+
+    Returns ``(np_array_2d, labels_list)``.
+    """
+    if isinstance(data, (tuple, list)) and len(data) == 2:
+        emb, labels = data
+        emb_np = np.asarray(emb)
+        if emb_np.ndim == 2 and isinstance(labels, list):
+            return emb_np.astype(np.float32, copy=False), list(labels)
+    arr = np.asarray(data).astype(np.float32, copy=False)
+    return arr, [f"item_{i}" for i in range(arr.shape[0])]
+
+
 def plot_tsne(
-    video_embeddings: jax.Array | np.ndarray,
-    text_embeddings: jax.Array | np.ndarray,
+    video_data,
+    text_data,
     *,
-    labels: list[str] | None = None,
+    bg_npz_vid_filepath: str | Path | None = None,
+    bg_npz_text_filepath: str | Path | None = None,
     seed: int = 42,
     perplexity: float | None = None,
     axis_padding: float = 0.10,
-    figsize: tuple[float, float] = (10, 8),
+    figsize: tuple[float, float] = (12, 10),
     show: bool = True,
+    save_path: str | Path | None = None,
 ):
     """Plot a joint t-SNE of video and text embeddings.
 
-    Video embeddings are shown as circles, text as crosses.
-    Matched pairs (same index) are connected by dashed lines.
+    Supports two modes:
+
+    **Simple mode** (no background npz files):
+        All video-text pairs are plotted with distinct per-video colours.
+        Video segments as circles, text segments as triangles, with dashed
+        lines connecting matched pairs.
+
+    **Background mode** (with ``bg_npz_vid_filepath`` & ``bg_npz_text_filepath``):
+        Background points (loaded from the npz files) are drawn in muted grey.
+        Foreground points (from ``video_data`` / ``text_data``) are drawn in
+        opaque, per-video colours.  Both layers use circles for video and
+        triangles for text, with dashed lines for matched pairs.
 
     Args:
-        video_embeddings: Array of shape ``(N, D)``.
-        text_embeddings: Array of shape ``(N, D)``.
-        labels: Optional label per sample (length ``N``).
+        video_data: Return value from :func:`get_video_embeddings` — either
+            an ``(embeddings, labels)`` tuple or a raw array ``(N, D)``.
+        text_data: Return value from :func:`get_text_embeddings` — either
+            an ``(embeddings, labels)`` tuple or a raw array ``(N, D)``.
+        bg_npz_vid_filepath: ``.npz`` file with keys ``video_embeddings`` and
+            ``video_labels`` (produced by ``get_video_embeddings(..., npz_filepath=...)``).
+        bg_npz_text_filepath: ``.npz`` file with keys ``text_embeddings`` and
+            ``text_labels`` (produced by ``get_text_embeddings(..., npz_filepath=...)``).
         seed: Random seed for t-SNE.
         perplexity: t-SNE perplexity; auto-chosen if *None*.
-        axis_padding: Extra margin added around t-SNE points as a fraction of
-            x/y data range (e.g., 0.10 adds 10% padding on each side).
-        figsize: Figure size passed to ``plt.subplots``.
+        axis_padding: Extra padding as fraction of data range.
+        figsize: Figure size.
+        show: Display the plot immediately.
+        save_path: If given, save the figure to this path.
 
     Returns:
         The matplotlib ``Figure`` when ``show=False``; otherwise ``None``.
     """
+    import matplotlib.lines as mlines
+
     import matplotlib.pyplot as plt
     from sklearn.manifold import TSNE
 
-    video_np = np.asarray(video_embeddings)
-    text_np = np.asarray(text_embeddings)
-    n = video_np.shape[0]
+    # ------------------------------------------------------------------
+    # Unpack foreground data
+    # ------------------------------------------------------------------
+    fg_vid_emb, fg_vid_labels = _unpack_embedding_data(video_data)
+    fg_txt_emb, fg_txt_labels = _unpack_embedding_data(text_data)
 
-    if labels is None:
-        labels = [f"sample_{i}" for i in range(n)]
-    assert len(labels) == n, f"Expected {n} labels, got {len(labels)}"
+    # ------------------------------------------------------------------
+    # Optionally load background data from npz files
+    # ------------------------------------------------------------------
+    has_background = (
+        bg_npz_vid_filepath is not None and bg_npz_text_filepath is not None
+    )
+    bg_vid_emb = bg_vid_labels = bg_txt_emb = bg_txt_labels = None
 
-    all_emb = np.concatenate([video_np, text_np], axis=0)  # (2N, D)
-    modality = ["video"] * n + ["text"] * n
-    all_labels = list(labels) + list(labels)
+    if has_background:
+        bg_vid_data = np.load(bg_npz_vid_filepath, allow_pickle=True)
+        bg_vid_emb = bg_vid_data["video_embeddings"].astype(np.float32)
+        bg_vid_labels = [str(x) for x in bg_vid_data["video_labels"]]
+
+        bg_txt_data = np.load(bg_npz_text_filepath, allow_pickle=True)
+        bg_txt_emb = bg_txt_data["text_embeddings"].astype(np.float32)
+        bg_txt_labels = [str(x) for x in bg_txt_data["text_labels"]]
+
+        print(
+            f"Background: {len(bg_vid_labels)} video + "
+            f"{len(bg_txt_labels)} text segments"
+        )
+
+    # ------------------------------------------------------------------
+    # Combine all embeddings for a single joint t-SNE
+    # ------------------------------------------------------------------
+    parts: list[np.ndarray] = []
+    if has_background:
+        parts.append(bg_vid_emb)
+        parts.append(bg_txt_emb)
+    parts.append(fg_vid_emb)
+    parts.append(fg_txt_emb)
+
+    all_emb = np.concatenate(parts, axis=0)
 
     if perplexity is None:
-        perplexity = min(5, max(2, len(all_emb) - 1))
+        perplexity = min(30, max(2, len(all_emb) // 3))
 
+    print(f"Running t-SNE on {len(all_emb)} points (perplexity={perplexity}) …")
     tsne = TSNE(
         n_components=2,
         perplexity=perplexity,
@@ -861,33 +968,113 @@ def plot_tsne(
         init="pca",
         learning_rate="auto",
     )
-    coords = tsne.fit_transform(all_emb)
+    all_coords = tsne.fit_transform(all_emb)
 
+    # Split coordinates back
+    idx = 0
+    bg_vid_coords = bg_txt_coords = None
+    if has_background:
+        n_bgv = len(bg_vid_labels)
+        bg_vid_coords = all_coords[idx : idx + n_bgv]
+        idx += n_bgv
+        n_bgt = len(bg_txt_labels)
+        bg_txt_coords = all_coords[idx : idx + n_bgt]
+        idx += n_bgt
+
+    n_fgv = fg_vid_emb.shape[0]
+    fg_vid_coords = all_coords[idx : idx + n_fgv]
+    idx += n_fgv
+    n_fgt = fg_txt_emb.shape[0]
+    fg_txt_coords = all_coords[idx : idx + n_fgt]
+
+    # ------------------------------------------------------------------
+    # Build figure
+    # ------------------------------------------------------------------
     fig, ax = plt.subplots(figsize=figsize)
-    unique_labels = sorted(set(labels))
-    cmap = plt.cm.get_cmap("tab10", len(unique_labels))
-    label_to_color = {lab: cmap(i) for i, lab in enumerate(unique_labels)}
 
-    for i in range(len(all_emb)):
-        color = label_to_color[all_labels[i]]
-        marker = "o" if modality[i] == "video" else "x"
+    # ---- Layer 1: Background (muted grey) ----------------------------
+    if has_background:
+        bg_color = "lightgray"
+        bg_alpha = 0.30
+        bg_s = 15
+
+        # Background video (circles)
         ax.scatter(
-            coords[i, 0], coords[i, 1],
-            c=[color], marker=marker, s=80,
-            edgecolors="k" if marker == "o" else "none", linewidths=0.5,
+            bg_vid_coords[:, 0], bg_vid_coords[:, 1],
+            c=bg_color, alpha=bg_alpha, s=bg_s, marker="o",
+            edgecolors="none", zorder=1,
+        )
+        # Background text (triangles)
+        ax.scatter(
+            bg_txt_coords[:, 0], bg_txt_coords[:, 1],
+            c=bg_color, alpha=bg_alpha, s=bg_s, marker="^",
+            edgecolors="none", zorder=1,
         )
 
-    # Lines connecting matched video-text pairs
-    for i in range(n):
-        ax.plot(
-            [coords[i, 0], coords[n + i, 0]],
-            [coords[i, 1], coords[n + i, 1]],
-            color=label_to_color[labels[i]], alpha=0.3, linestyle="--", linewidth=0.8,
-        )
+        # Background connecting lines
+        bg_txt_lookup = {lab: i for i, lab in enumerate(bg_txt_labels)}
+        for i, lab in enumerate(bg_vid_labels):
+            j = bg_txt_lookup.get(lab)
+            if j is not None:
+                ax.plot(
+                    [bg_vid_coords[i, 0], bg_txt_coords[j, 0]],
+                    [bg_vid_coords[i, 1], bg_txt_coords[j, 1]],
+                    color=bg_color, alpha=0.15, linestyle=":",
+                    linewidth=0.5, zorder=0,
+                )
 
-    # Expand axis limits so dense clusters and labels are easier to inspect.
-    x_min, x_max = float(np.min(coords[:, 0])), float(np.max(coords[:, 0]))
-    y_min, y_max = float(np.min(coords[:, 1])), float(np.max(coords[:, 1]))
+    # ---- Layer 2: Foreground (opaque, per-video colours) -------------
+    fg_vid_video_ids = [_strip_segment_suffix(lab) for lab in fg_vid_labels]
+    fg_txt_video_ids = [_strip_segment_suffix(lab) for lab in fg_txt_labels]
+    unique_video_ids = sorted(set(fg_vid_video_ids + fg_txt_video_ids))
+
+    cmap = plt.cm.get_cmap("tab10", max(len(unique_video_ids), 1))
+    vid_to_color = {vid: cmap(i) for i, vid in enumerate(unique_video_ids)}
+
+    fg_alpha = 0.90
+    fg_s_vid = 100
+    fg_s_txt = 120
+
+    for vid_id in unique_video_ids:
+        color = vid_to_color[vid_id]
+
+        # Video segments (circles)
+        v_idx = [i for i, x in enumerate(fg_vid_video_ids) if x == vid_id]
+        if v_idx:
+            ax.scatter(
+                fg_vid_coords[v_idx, 0], fg_vid_coords[v_idx, 1],
+                color=color, marker="o", s=fg_s_vid, alpha=fg_alpha,
+                edgecolors="white", linewidth=1.5,
+                label=f"{vid_id} (video)", zorder=3,
+            )
+
+        # Text segments (triangles)
+        t_idx = [i for i, x in enumerate(fg_txt_video_ids) if x == vid_id]
+        if t_idx:
+            ax.scatter(
+                fg_txt_coords[t_idx, 0], fg_txt_coords[t_idx, 1],
+                color=color, marker="^", s=fg_s_txt, alpha=fg_alpha,
+                edgecolors="black", linewidth=1.0,
+                label=f"{vid_id} (text)", zorder=3,
+            )
+
+    # Foreground connecting lines (match by label)
+    fg_txt_lookup = {lab: i for i, lab in enumerate(fg_txt_labels)}
+    for i, lab in enumerate(fg_vid_labels):
+        j = fg_txt_lookup.get(lab)
+        if j is not None:
+            vid_id = _strip_segment_suffix(lab)
+            color = vid_to_color[vid_id]
+            ax.plot(
+                [fg_vid_coords[i, 0], fg_txt_coords[j, 0]],
+                [fg_vid_coords[i, 1], fg_txt_coords[j, 1]],
+                color=color, alpha=0.6, linestyle="--",
+                linewidth=1.5, zorder=2,
+            )
+
+    # ---- Axis padding ------------------------------------------------
+    x_min, x_max = float(np.min(all_coords[:, 0])), float(np.max(all_coords[:, 0]))
+    y_min, y_max = float(np.min(all_coords[:, 1])), float(np.max(all_coords[:, 1]))
     x_range = max(x_max - x_min, 1e-8)
     y_range = max(y_max - y_min, 1e-8)
     x_pad = x_range * max(axis_padding, 0.0)
@@ -895,18 +1082,41 @@ def plot_tsne(
     ax.set_xlim(x_min - x_pad, x_max + x_pad)
     ax.set_ylim(y_min - y_pad, y_max + y_pad)
 
-    # Legend for labels
-    for lab in unique_labels:
-        ax.scatter([], [], c=[label_to_color[lab]], marker="s", label=lab)
-    # Legend for modality
-    ax.scatter([], [], c="gray", marker="o", label="video", edgecolors="k", linewidths=0.5)
-    ax.scatter([], [], c="gray", marker="x", label="text")
+    # ---- Legend ------------------------------------------------------
+    handles = []
+    if has_background:
+        handles.append(mlines.Line2D(
+            [], [], color="lightgray", marker="o", linestyle="None",
+            markersize=6, label="Background",
+        ))
+    handles.append(mlines.Line2D(
+        [], [], color="gray", marker="o", linestyle="None",
+        markersize=8, label="Video segment",
+    ))
+    handles.append(mlines.Line2D(
+        [], [], color="gray", marker="^", linestyle="None",
+        markersize=8, label="Text segment",
+    ))
+    handles.append(mlines.Line2D(
+        [], [], color="gray", linestyle="--", linewidth=1.5,
+        label="Video–text pair",
+    ))
+    for vid_id in unique_video_ids:
+        handles.append(mlines.Line2D(
+            [], [], color=vid_to_color[vid_id], marker="s",
+            linestyle="None", markersize=8, label=vid_id,
+        ))
 
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
-    ax.set_title("t-SNE: Video (o) & Text (x) Embeddings")
+    ax.legend(handles=handles, bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
+    ax.set_title("t-SNE: Video (●) & Text (▲) Embeddings")
     ax.set_xlabel("t-SNE 1")
     ax.set_ylabel("t-SNE 2")
     plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Plot saved to {save_path}")
+
     if show:
         plt.show()
 
