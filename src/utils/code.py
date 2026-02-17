@@ -1450,7 +1450,7 @@ def plot_similarity_matrix(
             if _base_name(_vid_labels[idx]) != _base_name(_vid_labels[idx - 1]):
                 ax.axvline(
                     x=idx - 0.5,
-                    color="black",
+                    color="red",
                     linewidth=2.6,
                     alpha=1.0,
                     zorder=5,
@@ -1459,7 +1459,7 @@ def plot_similarity_matrix(
             if _base_name(_txt_labels[idx]) != _base_name(_txt_labels[idx - 1]):
                 ax.axhline(
                     y=idx - 0.5,
-                    color="black",
+                    color="red",
                     linewidth=2.6,
                     alpha=1.0,
                     zorder=5,
