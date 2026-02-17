@@ -1365,9 +1365,10 @@ def generate_html_content(
 
         function formatTime(seconds) {{
             if (isNaN(seconds)) return "00:00.000";
-            const minutes = Math.floor(seconds / 60);
-            const secs = Math.floor(seconds % 60);
-            const ms = Math.floor((seconds % 1) * 1000);
+            const totalMs = Math.max(0, Math.round(Number(seconds) * 1000));
+            const minutes = Math.floor(totalMs / 60000);
+            const secs = Math.floor((totalMs % 60000) / 1000);
+            const ms = totalMs % 1000;
             return `${{String(minutes).padStart(2, '0')}}:${{String(secs).padStart(2, '0')}}` +
                    `.${{String(ms).padStart(3, '0')}}`;
         }}

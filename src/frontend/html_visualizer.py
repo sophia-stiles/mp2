@@ -215,23 +215,42 @@ class HTMLVideoAnnotationVisualizer:
 
     def _parse_timestamp_str(self, s: str) -> float:
         """Parse 'H:MM:SS.mmm' or 'MM:SS.mmm' timestamp string to seconds."""
-        parts = s.strip().split(".")
-        frac = int(parts[1]) / 1000.0 if len(parts) == 2 else 0.0
-        parts = parts[0].split(":")
-        if len(parts) == 3:
-            h, m, sec = int(parts[0]), int(parts[1]), int(parts[2])
-        elif len(parts) == 2:
-            h, m, sec = 0, int(parts[0]), int(parts[1])
+        text = str(s).strip()
+        if not text:
+            return 0.0
+        parts = text.split(".")
+        frac_ms = 0
+        if len(parts) >= 2:
+            frac_text = "".join(ch for ch in parts[1] if ch.isdigit())
+            if frac_text:
+                # Interpret any precision as fractional seconds, rounded to milliseconds.
+                frac_ms = int((Decimal(f"0.{frac_text}") * Decimal(1000)).to_integral_value(rounding=ROUND_HALF_UP))
+        hms = parts[0].split(":")
+        if len(hms) == 3:
+            h, m, sec = int(hms[0]), int(hms[1]), int(hms[2])
+        elif len(hms) == 2:
+            h, m, sec = 0, int(hms[0]), int(hms[1])
         else:
             return 0.0
-        return h * 3600 + m * 60 + sec + frac
+        total_ms = (h * 3600 + m * 60 + sec) * 1000 + frac_ms
+        return total_ms / 1000.0
 
     def seconds_to_time_str(self, seconds: float) -> str:
         """Convert seconds to MM:SS.mmm format."""
-        minutes = int(seconds // 60)
-        secs = int(seconds % 60)
-        milliseconds = int((seconds % 1) * 1000)
+        total_ms = int((Decimal(str(seconds)) * Decimal(1000)).to_integral_value(rounding=ROUND_HALF_UP))
+        if total_ms < 0:
+            total_ms = 0
+        minutes, rem_ms = divmod(total_ms, 60_000)
+        secs, milliseconds = divmod(rem_ms, 1000)
         return f"{minutes:02d}:{secs:02d}.{milliseconds:03d}"
+
+    def _time_for_ui(self, raw_time: Any, time_seconds: float) -> str:
+        """Prefer the original timestamp string when available to preserve exact formatting on save."""
+        if isinstance(raw_time, str):
+            text = raw_time.strip()
+            if text:
+                return text
+        return self.seconds_to_time_str(time_seconds)
 
     def load_annotations(self, video_file: str) -> dict[str, Any]:
         """Load annotations for a specific video."""
@@ -262,6 +281,8 @@ class HTMLVideoAnnotationVisualizer:
                     continue
                 t0_sec = self.time_to_seconds(ann["t0"])
                 t1_sec = self.time_to_seconds(ann["t1"])
+                t0_ui = self._time_for_ui(ann["t0"], t0_sec)
+                t1_ui = self._time_for_ui(ann["t1"], t1_sec)
                 processed_annotations.append(
                     {
                         "id": f"ann-{ann_idx}",
@@ -270,8 +291,8 @@ class HTMLVideoAnnotationVisualizer:
                         "end": t1_sec,
                         "text": str(segment_text),
                         "audio": ann.get("audio", ""),
-                        "start_str": self.seconds_to_time_str(t0_sec),
-                        "end_str": self.seconds_to_time_str(t1_sec),
+                        "start_str": t0_ui,
+                        "end_str": t1_ui,
                         "edited_desc": ann.get("edited_desc") == "Yes",
                         "edited_audio": ann.get("edited_audio") == "Yes",
                         "edited_start_time": ann.get("edited_start_time") == "Yes",
@@ -290,13 +311,15 @@ class HTMLVideoAnnotationVisualizer:
                         continue
                     t0_sec = self.time_to_seconds(query["t0"])
                     t1_sec = self.time_to_seconds(query["t1"])
+                    t0_ui = self._time_for_ui(query["t0"], t0_sec)
+                    t1_ui = self._time_for_ui(query["t1"], t1_sec)
                     processed.append(
                         {
                             "id": f"{prefix}-{q_idx}",
                             "start": t0_sec,
                             "end": t1_sec,
-                            "start_str": self.seconds_to_time_str(t0_sec),
-                            "end_str": self.seconds_to_time_str(t1_sec),
+                            "start_str": t0_ui,
+                            "end_str": t1_ui,
                             "text": str(query.get("text", "")),
                             "acknowledged": bool(query.get("acknowledged", False)),
                             "edited_text": query.get("edited_text") == "Yes",
